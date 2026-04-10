@@ -56,11 +56,24 @@ class DataCreatorSokobanPixelDiff:
         self.dim_room = detect_dim_room(self.data[0][0])
         self.num_boxes = detect_num_boxes(self.data[0][0])
 
+        # Convert every entry in the dataset from One-Hot to Tokens
+        print(f"Converting {len(self.data)} samples to token representation...")
+        for key in self.data:
+            entry = list(self.data[key])
+
+            # Loop through every board in the trajectory (all 26 elements)
+            for i in range(len(entry)):
+                # Only apply argmax if it's actually a one-hot board
+                if isinstance(entry[i], np.ndarray) and len(entry[i].shape) == 3:
+                    entry[i] = np.argmax(entry[i], axis=-1).astype(np.int32)
+
+            self.data[key] = tuple(entry)
+        print("Conversion complete.")
+
         self.log_env = SokobanEnvFast(self.dim_room, self.num_boxes)
         self.log_env.reset()
 
     def create_xy(self, steps, keys):
-
         print(f'running create_xy with {steps} steps and {keys} keys.')
         assert self.training_keys is not None and \
                self.validation_keys is not None, 'You must load data first.'
@@ -74,29 +87,24 @@ class DataCreatorSokobanPixelDiff:
 
         global_x = []
         global_y = []
+        global_goal = []
         for key in tqdm(keys_to_dataset[keys]):
             if random.random() < self._keep_trajectories:
-                x = list(self.data[key]).copy()
-                y = list(self.data[key]).copy()
+                traj = self.data[key]
+                n = len(traj)
 
-                last = y[-1]
-                y = y[steps:]
-                y = y + [last] * min(steps, len(x))
+                # The Final Goal is always the last board in the trajectory
+                final_goal = traj[-1]
 
-                all_elems = len(x)
-                elems_to_keep = int(len(x) * self._keep_samples)
-                indices_to_keep = random.sample(range(all_elems), elems_to_keep)
+                # Sample indices
+                indices = random.sample(range(n - steps), int((n - steps) * self._keep_samples))
 
-                x = [x[i] for i in indices_to_keep]
-                y = [y[i] for i in indices_to_keep]
+                for i in indices:
+                    global_x.append(traj[i])
+                    global_y.append(traj[i + steps])
+                    global_goal.append(final_goal)  # Every x/y pair needs the final destination
 
-                global_x.extend(x)
-                global_y.extend(y)
-
-        print(f'Dataset size has {len(global_x)} elements.')
-        global_x = np.array(global_x)
-        global_y = np.array(global_y)
-        return global_x, global_y
+        return np.array(global_x), np.array(global_y), np.array(global_goal)
 
     def create_x(self):
         global_x = []
@@ -180,6 +188,34 @@ class DataCreatorSokobanPixelDiff:
         output[x][y] = 1
         size = self.dim_room[0] * self.dim_room[1]
         return output.reshape(1, size)[0]
+
+    def create_xy_diffusion(self, keys):
+        global_x = []  # Current boards
+        global_cond = []  # Final Goal boards
+        global_budgets = []  # The 'b' (steps_into_future)
+        global_y = []  # The Subgoal (Target)
+
+        for key in tqdm(keys_to_dataset[keys]):
+            traj = self.data[key]  # List of 12x12 token grids
+            n = len(traj)
+
+            # Sample multiple pairs from this trajectory
+            for _ in range(self.samples_per_traj):
+                # Pick two random points in time: t1 (start) and t2 (subgoal)
+                # And t3 is the final destination (end of trajectory)
+                t1 = random.randint(0, n - 3)
+                t2 = random.randint(t1 + 1, n - 2)
+                t3 = n - 1
+
+                budget = t2 - t1  # This is your 'b'
+
+                global_x.append(traj[t1].flatten())
+                global_cond.append(traj[t3].flatten())
+                global_budgets.append(budget)
+                global_y.append(traj[t2].flatten())
+
+        return np.array(global_x), np.array(global_cond), \
+            np.array(global_budgets), np.array(global_y)
 
     def create_xy_split(self, steps, keys):
 

@@ -11,14 +11,16 @@ run.job_class = @jobs.JobTrainSokobanPixelDiff
 Sokoban.num_boxes = 4
 
 # Params for ConditionalGoalPredictorSokoban:
-GoalPredictorPixelDiff.num_layers = 4
+GoalPredictorPixelDiff.num_layers = 7
+GoalPredictorPixelDiff.batch_norm = True
 GoalPredictorPixelDiff.learning_rate = 1e-4
-GoalPredictorPixelDiff.batch_size = 64
+GoalPredictorPixelDiff.kernel_size = (3, 3)
+GoalPredictorPixelDiff.weight_decay = 1e-4
 
 # Params for JobTrainSokoban:
-JobTrainSokobanPixelDiff.dump_folder = 'out/train_mdlm'
+JobTrainSokobanPixelDiff.dump_folder = 'out/train'
 JobTrainSokobanPixelDiff.epochs = 200
-JobTrainSokobanPixelDiff.epochs_checkpoints = [1, 25, 50, 75, 100, 125, 150, 175, 200]
+JobTrainSokobanPixelDiff.epochs_checkpoints = [10, 25, 50, 75, 100, 125, 150, 175, 200]
 
 # Params for DataCreatorSokoban:
 # How many trajectories will be used in training (useful to limit for very large data sets):

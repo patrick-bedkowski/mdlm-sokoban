@@ -5,3 +5,7 @@ resume_old
 # exclude everything inside the out folder, except .gitkeep
 resume_old/*
 !resume_old/.gitkeep
+
+start_env.sh
+run_sokoban.sh
+*.zip

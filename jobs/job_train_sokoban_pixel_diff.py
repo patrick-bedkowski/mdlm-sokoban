@@ -5,6 +5,7 @@ from goal_generating_networks import ConditionalGoalPredictorSokoban, \
 from jobs.core import Job
 from supervised import DataCreatorSokoban, DataCreatorSokobanPixelDiff
 from utils.general_utils import readable_num
+import os
 
 
 class JobTrainSokobanPixelDiff(Job):
@@ -21,6 +22,8 @@ class JobTrainSokobanPixelDiff(Job):
         self.goal_generating_network = GoalPredictorPixelDiff()
         self.dataset = dataset
         self.dump_folder = dump_folder
+        if not os.path.exists(dump_folder):
+            os.makedirs(dump_folder)
         self.steps_into_future = steps_into_future
         self.epochs = epochs
         self.epochs_checkpoints = epochs_checkpoints
@@ -30,14 +33,22 @@ class JobTrainSokobanPixelDiff(Job):
     def execute(self):
         total_time_start = time.time()
 
+        # 1. Initialize the Transformer
         self.goal_generating_network.construct_networks()
+
+        # 2. Use the JOB's data creator to load and process data
         self.data_creator.load(self.dataset)
-        x_input, x_condition, ys = \
-            self.data_creator.create_xy_split(self.steps_into_future, 'train')
-        vx_input, vx_condition, vys = \
-            self.data_creator.create_xy_split(self.steps_into_future, 'validate')
-        self.goal_generating_network.fit_and_dump([x_input, x_condition],
-                                                  ys, ([vx_input, vx_condition], vys),
-                                                  self.epochs, self.dump_folder, self.epochs_checkpoints)
+
+        # Receive 3 arrays now
+        x_input, y_target, g_goal = self.data_creator.create_xy(self.steps_into_future, 'train')
+        vx_input, vy_target, vg_goal = self.data_creator.create_xy(self.steps_into_future, 'validate')
+
+        self.goal_generating_network.fit_and_dump(
+            [x_input, g_goal],  # Pass inputs as a list
+            y_target,
+            ([vx_input, vg_goal], vy_target),
+            self.epochs, self.dump_folder,
+            checkpoints=self.epochs_checkpoints
+        )
 
         return readable_num(time.time() - total_time_start)

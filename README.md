@@ -408,7 +408,7 @@ python3 runner.py \
 --config="ValueEstimator.model_id=\"${KSUBS_RESOURCES}/sokoban/value/12-12-4\""
 ```
 
-For both BestFS and BF-kSubS evaluation you can change size of board using 
+[For both BestFS and BF-kSubS evaluation you can change size]() of board using 
 `Sokoban.dim_room` parameter, but remember to adjust checkpoint paths as well.
 
 Note that these are single thread evaluations. They can be speed up by increasing 
