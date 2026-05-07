@@ -1,0 +1,94 @@
+""" OUTPUT
+
+Gram Matrix:
+[35.0366, 14.5578, 13.6654, 18.3317]
+[14.5578, 25.3774, 1.521, 0.4259]
+[13.6654, 1.521, 7.9963, 5.615]
+[18.3317, 0.4259, 5.615, 17.6246]
+====================
+b) SVM Predictions
+Linear Predictions: [1, 1, 1, 1]
+Polynomial Predictions: [1, 1, 1, 1]
+====================
+c) Error Analysis
+Linear Kernel Errors:     2 out of 4
+Polynomial Kernel Errors: 2 out of 4
+
+"""
+
+# 1. Input Data and Parameters
+data = [
+    [1.11, 2.54, 5.23],  # x1
+    [0.73, 4.98, 0.21],  # x2
+    [-0.93, 0.33, 2.65],  # x3
+    [2.75, -0.45, 3.14]  # x4
+]
+
+weights = [-0.5, 3.16, 2.77]
+expected_labels = [-1, -1, 1, 1]
+
+
+def dot_product(v1, v2):
+    """Calculates the scalar product of two vectors."""
+    return sum(x * y for x, y in zip(v1, v2))
+
+
+# The Gram matrix is G[i][j] = x_i * x_j
+gram_matrix = []
+for i in range(len(data)):
+    row = []
+    for j in range(len(data)):
+        result = dot_product(data[i], data[j])
+        row.append(round(result, 4))
+    gram_matrix.append(row)
+
+print("Gram Matrix:")
+for row in gram_matrix:
+    print(row)
+
+print("="*20)
+
+# b) SVM predictions.
+
+# For the linear kernel, I take the direct predictions w*x>0, the prediction class is 1, otherwise is -1
+# For polynomial kernel, I do the same, but I square the input features w*x^2>0.
+linear_predictions = []
+poly_predictions = []
+
+for x in data:
+    # linear keernel: sign(w * x)
+    linear_val = dot_product(weights, x)
+    linear_predictions.append(1 if linear_val >= 0 else -1)
+
+    # polynomial kernel (degree 2): sign(w * x^2)
+    # i apply the weights to the squared features per the task's context
+    x_squared = [val ** 2 for val in x]
+    poly_val = dot_product(weights, x_squared)
+    poly_predictions.append(1 if poly_val >= 0 else -1)
+
+print("b) SVM Predictions")
+
+print("Linear Predictions:", linear_predictions)
+print("Polynomial Predictions:", poly_predictions)
+
+print("="*20)
+
+# c) Error Calculation
+
+# Error is calculated as the total count of mismatches of predictions
+
+def calculate_error(predictions, expected):
+    """how many predictions do not match the expected labels."""
+    errors = 0
+    for p, e in zip(predictions, expected):
+        if p != e:
+            errors += 1
+    return errors
+
+
+linear_error = calculate_error(linear_predictions, expected_labels)
+poly_error = calculate_error(poly_predictions, expected_labels)
+
+print("c) Error Analysis")
+print(f"Linear Kernel Errors:     {linear_error} out of {len(data)}")
+print(f"Polynomial Kernel Errors: {poly_error} out of {len(data)}")

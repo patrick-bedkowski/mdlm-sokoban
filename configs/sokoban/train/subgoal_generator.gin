@@ -16,9 +16,10 @@ GoalPredictorPixelDiff.learning_rate = 1e-4
 GoalPredictorPixelDiff.batch_size = 64
 
 # Params for JobTrainSokoban:
-JobTrainSokobanPixelDiff.dump_folder = 'out/train_mdlm'
-JobTrainSokobanPixelDiff.epochs = 200
-JobTrainSokobanPixelDiff.epochs_checkpoints = [1, 25, 50, 75, 100, 125, 150, 175, 200]
+JobTrainSokobanPixelDiff.dump_folder = 'out/train_mdlm_28_04_26'
+# 27_04 - changed validation steps from 10 to 256,
+JobTrainSokobanPixelDiff.epochs = 201
+JobTrainSokobanPixelDiff.epochs_checkpoints = [25, 50, 75, 100, 125, 150, 175, 200]
 
 # Params for DataCreatorSokoban:
 # How many trajectories will be used in training (useful to limit for very large data sets):

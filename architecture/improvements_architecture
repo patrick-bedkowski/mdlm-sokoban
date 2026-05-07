@@ -1,0 +1,9 @@
+Specifically, we replace absolute positional embeddings with Rotary Positional Embeddings (RoPE)
+[37], which improve extrapolation to longer contexts and reduce parameter count. Furthermore, we
+adopt the SwiGLU activation function in the MLP blocks, which has been shown to outperform
+standard GELU or ReLU in both convergence and downstream performance [33]. To further simplify
+the architecture and enhance training stability, we substitute standard LayerNorm with RMSNorm
+and eliminate all bias terms. These design choices are consistent with [3, 40].
+
+
+

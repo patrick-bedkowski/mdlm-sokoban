@@ -44,8 +44,7 @@ class JobTrainSokobanPixelDiff(Job):
         vx_input, vy_target, vg_goal = self.data_creator.create_xy(self.steps_into_future, 'validate')
 
         self.goal_generating_network.fit_and_dump(
-            [x_input, g_goal],  # Pass inputs as a list
-            y_target,
+            ([x_input, g_goal], y_target),
             ([vx_input, vg_goal], vy_target),
             self.epochs, self.dump_folder,
             checkpoints=self.epochs_checkpoints

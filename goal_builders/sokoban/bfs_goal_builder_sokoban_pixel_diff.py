@@ -43,7 +43,7 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
 
 
     def create_root(self, input):
-        root =  np.array(input, copy=True)
+        root = np.array(input, copy=True)
         return GoalBuilderNode(input, root, 1, 0, False, 0, 0, None)
 
     def construct_networks(self):
@@ -89,6 +89,10 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
     def expand_node(self, node, pdf, internal_confidence_level, constructed_nodes):
         assert not node.done, 'node is already expanded'
         samples, probabilities = self.goal_generating_network.smart_sample(pdf, internal_confidence_level)
+
+        # # --- ADD THIS PRINT ---
+        # print(f"DEBUG EXPAND: smart_sample returned {len(samples)} samples.")
+        # # ----------------------
 
         for location, p in zip(samples, probabilities):
             if location[0] == self.dim_room[0]: # Model predicted end of state transformation
@@ -163,11 +167,10 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
 
         return accessible_goals
 
-    def _generate_goals(self, internal_confidence_level, input):
-        """
-        Generates goals, but does not check if they are accessible and does not crop number of goals.
-        """
-        root = self.create_root(input)
+
+    def _generate_goals(self, internal_confidence_level, input_board):
+        print(" >>>>>>>>>>>>>>>> Start building goals <<<<<<<<<<<<<< ")
+        root = self.create_root(input_board)
         self.all_nodes.append(root)
         constructed_nodes = {}
         tree_levels = {0: [root]}
@@ -186,6 +189,7 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
             tree_levels.setdefault(current_level_to_expand + 1, [])
 
             for node, pdf in zip(nodes_to_expand, pdfs):
+                # 3. expand_node creates candidate subgoals
                 self.expand_node(node, pdf, internal_confidence_level, constructed_nodes)
                 tree_levels[current_level_to_expand + 1] += node.children
 
@@ -195,5 +199,5 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
             current_level_to_expand += 1
 
         goals.sort(key=lambda x: x.p, reverse=True)
-
+        print("number of goals generated: ", len(goals))
         return goals

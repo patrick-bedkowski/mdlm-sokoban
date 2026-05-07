@@ -70,12 +70,16 @@ class BestFSSolverSokoban(GeneralSolverSokoban):
         self.max_tree_size = max_tree_size
         self.max_tree_depth = max_tree_depth
 
-        self.goal_builder =  goal_builder_class()
+        self.goal_builder = goal_builder_class()
         self.value_estimator = value_estimator_class()
 
     def construct_networks(self):
         self.value_estimator.construct_networks()
         self.goal_builder.construct_networks()
+
+    def load_networks(self):
+        # self.value_estimator.load_networks(path_to_weights)
+        self.goal_builder.load_networks()
 
     def solve(self, input, collect_data_for_graph_tracer=False):
 
@@ -94,6 +98,13 @@ class BestFSSolverSokoban(GeneralSolverSokoban):
         # cannot be compared, we add another dimension
         # with random number which are being compared in these rare situations.
         root_value = self.value_estimator.evaluate(root.state)
+
+        # --- ADD DEBUG PRINT HERE ---
+        print(f"DEBUG: Root State Shape: {root.state.shape}")
+        print(f"DEBUG: Root State Type: {type(root.state)}")
+        print(f"DEBUG: Root Value Received: {root_value}")
+        # ----------------------------
+
         root.set_value(root_value)
         nodes_queue.put((-root_value, random.random(), root))
         solution = []
@@ -156,6 +167,12 @@ class BestFSSolverSokoban(GeneralSolverSokoban):
                         current_node.add_child(new_node)
                         tree_depth = max(tree_depth, new_node.depth)
                         node_val = self.value_estimator.evaluate(new_node.state)
+
+                        # --- ADD DEBUG PRINT HERE ---
+                        print(f"DEBUG: Child State Shape: {new_node.state.shape}")
+                        print(f"DEBUG: Value for Child: {node_val}")
+                        # ----------------------------
+
                         new_node.set_value(node_val)
                         nodes_queue.put((-node_val, random.random(), new_node))
                         tree_size += 1
