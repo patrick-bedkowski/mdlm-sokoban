@@ -222,6 +222,10 @@ class SokobanTransformer(nn.Module):
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Parameter(torch.randn(1, 144, d_model))
 
+        # Inside SokobanTransformer.__init__
+        self.pos_emb_row = nn.Parameter(torch.randn(1, 12, 1, d_model // 2))
+        self.pos_emb_col = nn.Parameter(torch.randn(1, 1, 12, d_model // 2))
+
         # Time Embedding (Mask Ratio)
         self.time_mlp = nn.Sequential(
             nn.Linear(1, d_model),
@@ -388,9 +392,8 @@ class GoalPredictorPixelDiff:
                 b_y = train_y[batch_idx].to(self.device)
 
                 # 1. MASKING LOGIC: Only mask non-wall tokens
-                masked_inputs, mask_indices, mask_ratio = self._model.apply_stochastic_mask(b_y)
-
-                logits = self._model(b_x, b_cond, masked_inputs)
+                v_masked_inputs, v_mask_indices, v_mask_ratio = self._model.apply_stochastic_mask(bv_y)
+                logits = self._model(bv_x, bv_cond, v_masked_inputs, v_mask_ratio)
 
                 # 2. WEIGHTED LOSS: Apply token weights and LLaDA 1/t weighting
                 # CrossEntropy expects (B, C, L)
@@ -420,13 +423,9 @@ class GoalPredictorPixelDiff:
                     bv_y = val_y[i:i + self.batch_size].to(self.device)
 
                     # Standard Masking for Delta Check
-                    v_mask_ratio = torch.rand(bv_y.size(0), 1, device=self.device)
-                    v_mask_eligible = (bv_y != 0)
-                    v_mask_indices = (torch.rand(bv_y.shape, device=self.device) < v_mask_ratio) & v_mask_eligible
-
-                    v_masked_inputs = bv_y.clone()
-                    v_masked_inputs[v_mask_indices] = self.mask_token_id
-                    v_logits = self._model(bv_x, bv_cond, v_masked_inputs)
+                    # If you are calculating validation loss or accuracy
+                    v_masked_inputs, v_mask_indices, v_mask_ratio = self._model.apply_stochastic_mask(bv_y)
+                    v_logits = self._model(bv_x, bv_cond, v_masked_inputs, v_mask_ratio)
                     v_preds = torch.argmax(v_logits, dim=-1)
 
                     # 3. WALL STABILITY ACCURACY
