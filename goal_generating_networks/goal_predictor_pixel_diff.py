@@ -392,8 +392,8 @@ class GoalPredictorPixelDiff:
                 b_y = train_y[batch_idx].to(self.device)
 
                 # 1. MASKING LOGIC: Only mask non-wall tokens
-                v_masked_inputs, v_mask_indices, v_mask_ratio = self._model.apply_stochastic_mask(bv_y)
-                logits = self._model(bv_x, bv_cond, v_masked_inputs, v_mask_ratio)
+                masked_inputs, mask_indices, mask_ratio = self._model.apply_stochastic_mask(b_y)
+                logits = self._model(b_x, b_cond, masked_inputs, mask_ratio)
 
                 # 2. WEIGHTED LOSS: Apply token weights and LLaDA 1/t weighting
                 # CrossEntropy expects (B, C, L)
@@ -452,7 +452,7 @@ class GoalPredictorPixelDiff:
                         timesteps = torch.linspace(1, 0, inf_steps + 1)
                         for step in range(inf_steps):
                             t_next = timesteps[step + 1]
-                            i_logits = self._model(bv_x, bv_cond, cur_dream)
+                            i_logits = self._model(bv_x, bv_cond, cur_dream, t_next.unsqueeze(0).to(self.device))
                             i_probs = torch.softmax(i_logits, dim=-1)
                             confidences, predictions = torch.max(i_probs, dim=-1)
 
