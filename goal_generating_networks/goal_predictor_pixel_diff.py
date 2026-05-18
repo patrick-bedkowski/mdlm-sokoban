@@ -1,7 +1,9 @@
 import gc
 import os
+from collections import defaultdict
 
 import wandb
+# wandb.login(key="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")
 wandb.login("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")
 
 from datetime import datetime
@@ -35,6 +37,7 @@ import numpy as np
 from metric_logging import log_scalar
 from envs import Sokoban
 from supervised import DataCreatorSokobanPixelDiff
+from goal_generating_networks.sokoban_metrics import compute_sokoban_metrics
 
 import matplotlib.pyplot as plt
 import os
@@ -326,6 +329,7 @@ class GoalPredictorPixelDiff:
         self.data_creator = DataCreatorSokobanPixelDiff()
 
         self.date_now = datetime.now().strftime('%H-%M-%d-%m-%Y')
+        self.predictor_name = "v3_full_remask"
 
 
     def construct_networks(self):
@@ -346,7 +350,7 @@ class GoalPredictorPixelDiff:
             self.load_parameters()
 
         # init wandb
-        run_name = f"{self._model.architecture_name}_{self.date_now}"
+        run_name = f"{self.predictor_name}_{self._model.architecture_name}_{self.date_now}"
         wandb.init(
             project="sokoban-diffusion-llm",
             entity="bedkowski-patrick",
@@ -360,6 +364,84 @@ class GoalPredictorPixelDiff:
             }
         )
 
+    
+    def _denoise_full_reeval(self, inp, cond, inf_steps=256):
+        """
+        Approach 1: Full Re-evaluation with Remasking.
+        
+        At each step:
+        1. Run the model on the CURRENT dream state (partially masked).
+        2. Get predictions and confidence for ALL positions.
+        3. Determine how many tokens should be revealed at this timestep.
+        4. From all eligible (non-wall) positions, keep only the top-k
+            most confident predictions. Everything else gets RE-MASKED.
+        
+        This allows the model to CORRECT early mistakes — a token revealed
+        at step 50 can be re-masked at step 100 if the model becomes less
+        confident about it given new context from other revealed tokens.
+        
+        Args:
+            inp:  (B, 144) input board tokens
+            cond: (B, 144) solved board tokens
+            inf_steps: number of diffusion steps
+        
+        Returns:
+            cur_dream: (B, 144) final denoised board
+        """
+        batch_size, seq_len = inp.shape
+        device = inp.device
+
+        # Initialize: all eligible tokens masked, walls pre-filled
+        cur_dream = torch.full((batch_size, seq_len), self.mask_token_id, 
+                            dtype=torch.long, device=device)
+        
+        # Walls are NEVER masked — they are structural and known from input
+        wall_mask = (inp == 0)  # (B, 144) True where walls are
+        cur_dream[wall_mask] = 0
+
+        # Count eligible (non-wall) tokens per sample
+        eligible_mask = ~wall_mask  # (B, 144) True where non-wall
+        num_eligible = eligible_mask.float().sum(dim=1)  # (B,)
+
+        # Timestep schedule: t goes from 1.0 (fully masked) → 0.0 (fully revealed)
+        timesteps = torch.linspace(1.0, 0.0, inf_steps + 1, device=device)
+
+        for step in range(inf_steps):
+            t_current = timesteps[step]      # current masking level
+            t_next = timesteps[step + 1]     # target masking level after this step
+
+            # 1. Tell the model the current masking ratio
+            t_input = t_current.view(1, 1).expand(batch_size, 1)
+
+            # 2. Full forward pass — model predicts ALL positions
+            logits = self._model(inp, cond, cur_dream, t_input)
+            probs = torch.softmax(logits, dim=-1)
+            confidences, predictions = torch.max(probs, dim=-1)  # (B, 144)
+
+            # 3. Determine how many eligible tokens to REVEAL at this point
+            #    At t_next, we want (1 - t_next) fraction of eligible tokens revealed
+            num_to_reveal = ((1.0 - t_next) * num_eligible).long()  # (B,)
+
+            # 4. For each sample, rebuild the dream state from scratch
+            #    Only the top-k most confident eligible predictions survive
+            new_dream = torch.full_like(cur_dream, self.mask_token_id)
+            new_dream[wall_mask] = 0  # walls always visible
+
+            for b in range(batch_size):
+                # Get confidence scores only for eligible positions
+                scores = confidences[b].clone()
+                scores[~eligible_mask[b]] = -1.0  # exclude walls from competition
+
+                # Select the top num_to_reveal positions by confidence
+                k = min(num_to_reveal[b].item(), eligible_mask[b].sum().item())
+                if k > 0:
+                    _, top_indices = torch.topk(scores, k=k)
+                    new_dream[b, top_indices] = predictions[b, top_indices]
+
+            cur_dream = new_dream
+
+        return cur_dream
+
     def load_parameters(self):
         path = self.model_id
         print("loading model parameters from {}".format(path))
@@ -368,9 +450,9 @@ class GoalPredictorPixelDiff:
         # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f"Model parameters loaded from {path}")
 
+
     def fit_and_dump(self, training_data, validation_data, epochs, dump_folder, checkpoints=None):
         # 1. Flatten the inputs to (N, 144) to avoid 3D broadcasting errors
-        # x[0] is current, x[1] is final goal
         (t_inputs, t_targets) = training_data
         train_x = torch.tensor(t_inputs[0], dtype=torch.long).reshape(t_inputs[0].shape[0], -1)
         train_cond = torch.tensor(t_inputs[1], dtype=torch.long).reshape(t_inputs[1].shape[0], -1)
@@ -385,41 +467,29 @@ class GoalPredictorPixelDiff:
             train_x.shape, train_y.shape, train_cond.shape))
         print(f"DEBUG: Validation X shape: {val_x.shape} | Validation Y shape: {val_y.shape} | Validation G shape: {val_g.shape}")
 
-        # print('DATA SAVED')
-        # # save example inputs to the txt file
-        # with open(os.path.join(dump_folder, 'example_inputs.txt'), 'w') as f:
-        #     f.write(f"Example Training Input (current state):\n{train_x[0].view(12, 12)}\n")
-        #     f.write(f"Example Training Condition (final goal):\n{train_cond[0].view(12, 12)}\n")
-        #     f.write(f"Example Training Target (midpoint):\n{train_y[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Input (current state):\n{val_x[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Condition (final goal):\n{val_g[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Target (midpoint):\n{val_y[0].view(12, 12)}\n")
-
         num_samples = train_x.shape[0]
 
         for epoch in range(epochs):
             # --- TRAINING PHASE ---
             self._model.train()
             epoch_train_loss = 0
-            indices = torch.randperm(num_samples)  # used for randomly shuffling the data at each epoch
+            indices = torch.randperm(num_samples)
 
-            for i in range(0, num_samples, self.batch_size):  # process all the batches
+            for i in range(0, num_samples, self.batch_size):  # calculate the batches
                 batch_idx = indices[i:i + self.batch_size]
                 b_x = train_x[batch_idx].to(self.device)
                 b_cond = train_cond[batch_idx].to(self.device)
                 b_y = train_y[batch_idx].to(self.device)
 
-                # 1. MASKING LOGIC: Only mask non-wall tokens
+                # 1. MASKING LOGIC
                 masked_inputs, mask_indices, mask_ratio = self._model.apply_stochastic_mask(b_y)
                 logits = self._model(b_x, b_cond, masked_inputs, mask_ratio)
 
-                # 2. WEIGHTED LOSS: Apply token weights and LLaDA 1/t weighting
-                # CrossEntropy expects (B, C, L)
+                # 2. LOSS: only on masked positions, normalized by count
                 loss_raw = self.criterion(logits.transpose(1, 2), b_y)
-
-                masked_loss = (loss_raw * mask_indices.float()).sum(dim=1)  # sum CE on masked positions
-                num_masked = mask_indices.float().sum(dim=1)  # actual count
-                final_loss = (masked_loss / (num_masked + 1e-6)).mean()  # average per masked token
+                masked_loss = (loss_raw * mask_indices.float()).sum(dim=1)
+                num_masked = mask_indices.float().sum(dim=1)
+                final_loss = (masked_loss / (num_masked + 1e-6)).mean()
 
                 self.optimizer.zero_grad()
                 final_loss.backward()
@@ -434,61 +504,51 @@ class GoalPredictorPixelDiff:
             val_full_denoise_acc = 0
 
             with torch.no_grad():
+                all_metrics = defaultdict(list)
                 for i in range(0, val_x.size(0), self.batch_size):
                     bv_x = val_x[i:i + self.batch_size].to(self.device)
                     bv_cond = val_g[i:i + self.batch_size].to(self.device)
                     bv_y = val_y[i:i + self.batch_size].to(self.device)
 
                     # Standard Masking for Delta Check
-                    # If you are calculating validation loss or accuracy
                     v_masked_inputs, v_mask_indices, v_mask_ratio = self._model.apply_stochastic_mask(bv_y)
                     v_logits = self._model(bv_x, bv_cond, v_masked_inputs, v_mask_ratio)
                     v_preds = torch.argmax(v_logits, dim=-1)
 
-                    # 3. WALL STABILITY ACCURACY
-                    # Check accuracy only on tokens that are walls in the ground truth
+                    # WALL STABILITY ACCURACY
                     wall_mask = (bv_y == 0)
                     if wall_mask.sum() > 0:
                         wall_correct = (v_preds == bv_y) & wall_mask
                         val_wall_acc += wall_correct.sum().item() / (wall_mask.sum().item() + 1e-6)
 
-                    # DELTA ACCURACY: Only check accuracy on tiles that changed (Agent/Boxes)
+                    # DELTA ACCURACY
                     change_mask = (bv_x != bv_y)
                     critical_mask = v_mask_indices & change_mask
                     if critical_mask.sum() > 0:
                         correct = (v_preds == bv_y) & critical_mask
                         val_delta_acc += correct.sum().item() / (critical_mask.sum().item() + 1e-6)
 
-                    # FULL DENOISING CHECK (LLaDA Low-Confidence Remasking)
+                    # ============================================================
+                    # FULL DENOISING: Approach 1 — Full Re-evaluation at Each Step
+                    # ============================================================
                     if i == 0:
-                        inf_steps = 256
-                        cur_dream = torch.full_like(bv_y, self.mask_token_id)
-                        # PROTECT WALLS in starting dream: Start with walls already visible
-                        cur_dream = torch.where(bv_x == 0, 0, cur_dream)
-
-                        timesteps = torch.linspace(1, 0, inf_steps + 1)
-                        for step in range(inf_steps):
-                            t_next = timesteps[step + 1]
-                            t_input = t_next.view(1, 1).expand(bv_x.size(0), 1).to(self.device)
-                            i_logits = self._model(bv_x, bv_cond, cur_dream, t_input)
-                            i_probs = torch.softmax(i_logits, dim=-1)
-                            confidences, predictions = torch.max(i_probs, dim=-1)
-
-                            is_masked = (cur_dream == self.mask_token_id)
-                            num_to_keep = int((1 - t_next) * bv_y.size(1))
-
-                            for b in range(bv_x.size(0)):
-                                score = confidences[b].clone()
-                                score[~is_masked[b]] = 1.1
-                                _, top_indices = torch.topk(score, k=num_to_keep)
-
-                                new_state = torch.full_like(cur_dream[b], self.mask_token_id)
-                                # Keep walls visible even if they weren't in top-k
-                                new_state[bv_x[b] == 0] = 0
-                                new_state[top_indices] = predictions[b][top_indices]
-                                cur_dream[b] = new_state
-
+                        cur_dream = self._denoise_full_reeval(
+                            bv_x, bv_cond, inf_steps=256
+                        )
                         val_full_denoise_acc = (cur_dream == bv_y).float().mean().item()
+
+                        # Compute all metrics
+                        batch_metrics = compute_sokoban_metrics(
+                            pred_board   = cur_dream,
+                            input_board  = bv_x,
+                            target_board = bv_y,
+                            goal_board   = bv_cond
+                        )
+                        for k, v in batch_metrics.items(): all_metrics[k].append(v)
+
+            # Average across all batches
+            avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+            wandb.log({f"val_rules/{k}": v for k, v in avg_metrics.items()})
 
             avg_val_delta = val_delta_acc / (val_x.size(0) / self.batch_size)
             avg_val_wall = val_wall_acc / (val_x.size(0) / self.batch_size)
@@ -502,29 +562,34 @@ class GoalPredictorPixelDiff:
             })
 
             if epoch % 5 == 0:
-                grid_img = self.predict_and_get_wandb_image(val_x[0:1], val_g[0:1])
-                wandb.log({"media/diffusion_process": grid_img})
+                grid_img = self.predict_and_get_wandb_image(val_x[0:1], val_g[0:1],
+                                                            ground_truth_subgoal=val_y[0:1])
+                wandb.log({"media/diffusion_process_sample1": grid_img})
 
-            print(f"Epoch {epoch} | Delta Acc: {avg_val_delta:.4f} | Wall Stability: {avg_val_wall:.4f} | Full Denoise Acc: {val_full_denoise_acc:.4f}")
+                grid_img = self.predict_and_get_wandb_image(val_x[1:2], val_g[1:2],
+                                                            ground_truth_subgoal=val_y[1:2])
+                wandb.log({"media/diffusion_process_sample2": grid_img})
+
+                grid_img = self.predict_and_get_wandb_image(val_x[2:3], val_g[2:3],
+                                                            ground_truth_subgoal=val_y[2:3])
+                wandb.log({"media/diffusion_process_sample3": grid_img})
+
+            print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Delta Acc: {avg_val_delta:.4f} | Wall Stability: {avg_val_wall:.4f} | Full Denoise Acc: {val_full_denoise_acc:.4f}")
             log_scalar('val_delta_accuracy', epoch, avg_val_delta)
             log_scalar('val_full_denoise_acc', epoch, val_full_denoise_acc)
-
-            # Logging
-            print(
-                f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f}")
             log_scalar('train_loss', epoch, avg_train_loss)
 
             if checkpoints is not None and epoch in checkpoints:
                 self.save_model(os.path.join(dump_folder, f'epoch_{epoch}.pt'))
 
-    def predict_and_get_wandb_image(self, input_boards, conditions):
+    def predict_and_get_wandb_image(self, input_boards, conditions, ground_truth_subgoal=None):
         """Helper to run prediction and return a wandb Image object."""
-        # This calls your predict_pdf_batch logic but returns the plot
-        _, plot_path = self.predict_pdf_batch(input_boards.cpu().numpy(), conditions.cpu().numpy(), steps=256)
-        # save_diffusion_grid(..., dump_folder=self.dump_folder)
+        _, plot_path = self.predict_pdf_batch(
+            input_boards.cpu().numpy(), conditions.cpu().numpy(), ground_truth_subgoal=ground_truth_subgoal.cpu().numpy() if ground_truth_subgoal is not None else None, steps=256
+        )
         return wandb.Image(plot_path, caption="Diffusion Steps")
 
-    def predict_pdf_batch(self, input_boards, conditions, steps=256):
+    def predict_pdf_batch(self, input_boards, conditions, ground_truth_subgoal=None, steps=256):
         self._predictions_counter += 1
         self._model.eval()
 
@@ -534,71 +599,122 @@ class GoalPredictorPixelDiff:
 
         # Handle Input Boards (144 vs 1008)
         if input_boards.shape[-1] == 1008:
-            # Reshape (B, 1008) -> (B, 144, 7) then argmax to (B, 144)
             input_tokens = np.argmax(input_boards.reshape(-1, 144, 7), axis=-1)
         elif input_boards.shape[-1] == 7:
             input_tokens = np.argmax(input_boards, axis=-1)
         else:
             input_tokens = input_boards
 
-        # Handle Conditions / Final Goal (The likely source of the 1008)
+        # Handle Conditions / Final Goal
         if conditions.shape[-1] == 1008:
-            # Reshape (B, 1008) -> (B, 144, 7) then argmax to (B, 144)
             cond_tokens = np.argmax(conditions.reshape(-1, 144, 7), axis=-1)
         elif conditions.shape[-1] == 7:
-            conditions = np.argmax(conditions, axis=-1)
+            cond_tokens = np.argmax(conditions, axis=-1)
+        else:
+            cond_tokens = conditions
+
+        # Handle Ground Truth Subgoal (if provided)
+        if ground_truth_subgoal is not None:
+            if ground_truth_subgoal.ndim == 3:
+                ground_truth_subgoal = np.expand_dims(ground_truth_subgoal, axis=0)
+            if ground_truth_subgoal.shape[-1] == 1008:
+                gt_subgoal_tokens = np.argmax(ground_truth_subgoal.reshape(-1, 144, 7), axis=-1)
+            elif ground_truth_subgoal.shape[-1] == 7:
+                gt_subgoal_tokens = np.argmax(ground_truth_subgoal, axis=-1)
+            else:
+                gt_subgoal_tokens = ground_truth_subgoal
+        else:
+            gt_subgoal_tokens = None
 
         batch_size = input_tokens.shape[0]
 
-        # Data collection for 4x4 grid (16 slots)
-        # Slot 0: Input, Slot 15: Final, Slots 1-14: Intermediate
+        # Data collection for 4x4 grid (16 slots):
+        # Slot 0: Input Board
+        # Slot 1: Ground Truth Subgoal (if available)
+        # Slots 2-13: 12 Intermediate Diffusion Steps
+        # Slot 14: Final Dream (Prediction)
+        # Slot 15: Final Board (Solved State)
         collected_boards = []
         collected_labels = []
-
-        # Save the absolute input state as the first slot
+        # Slot 0: Input state
         collected_boards.append(input_tokens[0].copy())
         collected_labels.append("Initial Input")
 
+        # Slot 1: Ground Truth Subgoal (or placeholder)
+        if gt_subgoal_tokens is not None:
+            collected_boards.append(gt_subgoal_tokens[0].copy())
+            collected_labels.append("GT Subgoal")
+        else:
+            collected_boards.append(input_tokens[0].copy())  # duplicate input as placeholder
+            collected_labels.append("(No GT)")
+
+
         # 2. Setup Tensors
         inp = torch.tensor(input_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
-        cond = torch.tensor(conditions.reshape(batch_size, -1), dtype=torch.long).to(self.device)
-        cur_subgoals = torch.full((batch_size, 144), self.mask_token_id, dtype=torch.long).to(self.device)
+        cond = torch.tensor(cond_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
 
-        # 3. Diffusion Loop
-        # Calculate which indices to save to fill the 14 intermediate slots
-        # 256 / 14 ~ every 18 steps
-        save_indices = np.linspace(0, steps - 1, 14, dtype=int)
+        # Initialize fully masked dream (walls pre-filled)
+        seq_len = 144
+        cur_dream = torch.full((batch_size, seq_len), self.mask_token_id,
+                            dtype=torch.long, device=self.device)
+        wall_mask = (inp == 0)
+        cur_dream[wall_mask] = 0
 
-        for i in range(steps):
+        # Eligible tokens (non-wall)
+        eligible_mask = ~wall_mask  # (B, 144)
+        num_eligible = eligible_mask.float().sum(dim=1)  # (B,)
+
+        # 3. Diffusion Loop — Full Re-evaluation with Remasking
+        save_indices = np.linspace(0, steps - 1, 12, dtype=int)
+        timesteps = torch.linspace(1.0, 0.0, steps + 1, device=self.device)
+
+        for step in range(steps):
+            t_current = timesteps[step]
+            t_next = timesteps[step + 1]
+
             with torch.no_grad():
-                t_val = torch.full((batch_size, 1), (steps - i) / steps, device=self.device)
-                logits = self._model(inp, cond, cur_subgoals, t_val)
+                # Pass current masking ratio to model
+                t_input = t_current.view(1, 1).expand(batch_size, 1)
+                logits = self._model(inp, cond, cur_dream, t_input)
                 probs = torch.softmax(logits, dim=-1)
-                max_probs, pred_ids = torch.max(probs, dim=-1)
+                confidences, predictions = torch.max(probs, dim=-1)
 
-                is_masked = (cur_subgoals == self.mask_token_id)
-                num_masked = is_masked[0].sum().item()
-                num_to_reveal = int(np.ceil(num_masked / (steps - i)))
+                # How many eligible tokens should be revealed after this step
+                num_to_reveal = ((1.0 - t_next) * num_eligible).long()
+
+                # Rebuild dream from scratch — full re-evaluation
+                new_dream = torch.full_like(cur_dream, self.mask_token_id)
+                new_dream[wall_mask] = 0
 
                 for b in range(batch_size):
-                    if num_to_reveal > 0:
-                        conf = max_probs[b].clone()
-                        conf[~is_masked[b]] = -1.0
-                        _, top_idx = torch.topk(conf, k=min(num_to_reveal, num_masked))
-                        cur_subgoals[b, top_idx] = pred_ids[b, top_idx]
+                    scores = confidences[b].clone()
+                    scores[~eligible_mask[b]] = -1.0
 
-            # Log to list if it's one of our 14 capture points
-            if i in save_indices:
-                collected_boards.append(cur_subgoals[0].cpu().numpy().copy())
-                collected_labels.append(f"Diff Step {i}")
+                    k = min(num_to_reveal[b].item(), eligible_mask[b].sum().item())
+                    if k > 0:
+                        _, top_indices = torch.topk(scores, k=k)
+                        new_dream[b, top_indices] = predictions[b, top_indices]
 
-        # Add the Final Dream state as the 16th slot
-        dream_tokens_flat = cur_subgoals.cpu().numpy().reshape(batch_size, 144)
+                cur_dream = new_dream
+
+            # Capture intermediate states for visualization
+            if step in save_indices:
+                collected_boards.append(cur_dream[0].cpu().numpy().copy())
+                collected_labels.append(f"Step {step} (t={t_current:.2f})")
+
+        # Add final state
+        dream_tokens_flat = cur_dream.cpu().numpy().reshape(batch_size, 144)
         collected_boards.append(dream_tokens_flat[0])
         collected_labels.append("Final Dream")
 
-        # 4. Trigger Visualization
-        save_path = save_diffusion_grid(collected_boards, collected_labels, self.dump_folder, self._predictions_counter)
+        # Slot 15: Final Board (solved state)
+        collected_boards.append(cond_tokens[0])
+        collected_labels.append("Final Board")
+
+        # 4. Visualization
+        save_path = save_diffusion_grid(
+            collected_boards, collected_labels, self.dump_folder, self._predictions_counter
+        )
 
         # 5. Legacy Adapter Logic (Returning PDF to Solver)
         input_tokens_flat = input_tokens.reshape(batch_size, 144)
@@ -644,11 +760,15 @@ class GoalPredictorPixelDiff:
         return x, y, element
 
     def smart_sample(self, pdf, internal_confidence_level):
+        pdf = np.array(pdf).squeeze()  # ensure shape (1009,)
+        assert pdf.ndim == 1, f"Expected 1D pdf, got shape {pdf.shape}"
+        
         out, out_p = [], []
         for idx in reversed(np.argsort(pdf)):
-            out.append(self.flat_to_2d(idx))
-            out_p.append(pdf[idx])
-            if sum(out_p) > internal_confidence_level: break
+            out.append(self.flat_to_2d(int(idx)))  # explicit cast too
+            out_p.append(float(pdf[idx]))
+            if sum(out_p) > internal_confidence_level:
+                break
         return out, out_p
 #
 # class GoalPredictorPixelDiff:
