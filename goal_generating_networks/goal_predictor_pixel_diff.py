@@ -44,22 +44,21 @@ import os
 import numpy as np
 
 
-def save_diffusion_grid(boards, steps, dump_folder, batch_idx=0):
+def save_diffusion_grid(boards, steps, dump_folder, batch_idx="0"):
     """
-    Plots a 4x4 grid of Sokoban board states.
-    boards: List of 16 numpy arrays (12x12).
-    steps: List of strings/ints identifying the step for each board.
+    Plots a 4x4 grid of Sokoban board states for a single sample.
+    boards: List of 16 flattened numpy arrays (144 items each).
+    steps: List of 16 labels corresponding to each board slot.
     """
-    # Mapping: 0:Floor, 1:Wall, 2:Goal, 3:Box, 4:BoxOnGoal, 5:Agent, 6:AgentOnGoal, 7:MASK
     colors = {
-        0: 'white',  # Floor
-        1: 'black',  # Wall
-        2: 'lightgreen',  # Goal
+        0: 'white',        # Floor
+        1: 'black',        # Wall
+        2: 'lightgreen',   # Goal
         3: 'saddlebrown',  # Box
-        4: 'green',  # BoxOnGoal
-        5: 'red',  # Agent
-        6: 'darkred',  # AgentOnGoal
-        7: 'lightgray'  # MASK
+        4: 'green',        # BoxOnGoal
+        5: 'red',          # Agent
+        6: 'darkred',      # AgentOnGoal
+        7: 'lightgray'     # MASK
     }
 
     fig, axes = plt.subplots(4, 4, figsize=(12, 12))
@@ -68,10 +67,7 @@ def save_diffusion_grid(boards, steps, dump_folder, batch_idx=0):
     for i, ax in enumerate(axes.flat):
         if i < len(boards):
             board = boards[i].reshape(12, 12)
-            # Create a color matrix
-            color_matrix = np.vectorize(colors.get)(board)
 
-            # Since ax.imshow needs RGB or specific types, we plot tiles
             for r in range(12):
                 for c in range(12):
                     tile_color = colors.get(int(board[r, c]), 'white')
@@ -79,7 +75,7 @@ def save_diffusion_grid(boards, steps, dump_folder, batch_idx=0):
 
             ax.set_xlim(0, 12)
             ax.set_ylim(0, 12)
-            ax.set_title(f"Step: {steps[i]}")
+            ax.set_title(str(steps[i]), fontsize=10)
             ax.set_aspect('equal')
 
         ax.set_xticks([])
@@ -87,11 +83,14 @@ def save_diffusion_grid(boards, steps, dump_folder, batch_idx=0):
 
     os.makedirs(dump_folder, exist_ok=True)
     save_path = os.path.join(dump_folder, f"diffusion_grid_batch_{batch_idx}.png")
-    plt.savefig(save_path)
+    plt.savefig(save_path, bbox_inches='tight')
     plt.close()
     print(f"Diffusion grid saved to {save_path}")
 
-    # log the image to wandb
+    # Optional Weights & Biases tracking:
+    if wandb.run is not None:
+        wandb.log({f"media/diffusion_grid_{batch_idx}": wandb.Image(save_path)})
+
     return save_path
 
 
@@ -322,10 +321,8 @@ class GoalPredictorPixelDiff:
             n_of_samples_to_collect=5):
         """
         Performs the iterative denoising process.
-        Returning the final "dream" board and a list of intermediate boards for visualization.
+        Returning a list of intermediate batch states and the final predicted tensor.
         """
-
-        collected_boards = []
         batch_size, seq_len = inp.shape
         device = inp.device
 
@@ -336,69 +333,53 @@ class GoalPredictorPixelDiff:
         cur_dream = torch.full_like(inp, self.mask_token_id)
         cur_dream[wall_mask] = 0
 
-        timesteps = torch.linspace(
-            1.0,
-            0.0,
-            inf_steps + 1,
-            device=device
-        )
+        timesteps = torch.linspace(1.0, 0.0, inf_steps + 1, device=device)
+
+        # Calculate 12 evenly spaced step indices to collect intermediate states
+        collect_steps = torch.linspace(0, inf_steps - 1, steps=12, dtype=torch.long).tolist()
+        intermediate_boards = []
 
         for step in range(inf_steps):
+            # Collect intermediate frames at the scheduled steps
+            if step in collect_steps:
+                intermediate_boards.append(cur_dream.clone().cpu().numpy())
+
             t_current = timesteps[step]
             t_next = timesteps[step + 1]
             t_input = t_current.view(1, 1).expand(batch_size, 1)
-            logits = self._model(
-                inp,
-                cond,
-                cur_dream,
-                t_input
-            )
 
+            logits = self._model(inp, cond, cur_dream, t_input)
             scaled_logits = logits / temperature
             probs = torch.softmax(scaled_logits, dim=-1)
             confidences, predictions = probs.max(dim=-1)
 
-            num_to_mask = (
-                    t_next * num_eligible
-            ).long()
+            num_to_mask = (t_next * num_eligible).long()
             next_dream = predictions.clone()
             next_dream[wall_mask] = 0
+
             if step != inf_steps - 1:
                 for b in range(batch_size):
-                    k = min(
-                        num_to_mask[b].item(),
-                        eligible_mask[b].sum().item()
-                    )
-
+                    k = min(num_to_mask[b].item(), eligible_mask[b].sum().item())
                     if k == 0:
                         continue
+
                     scores = confidences[b].clone()
                     scores[wall_mask[b]] = 1.0
+
                     if stochastic:
                         uncertainties = 1.0 - scores
                         uncertainties[wall_mask[b]] = 0
-                        probs_remask = (
-                                uncertainties /
-                                (uncertainties.sum() + 1e-8)
-                        )
-                        remask_indices = torch.multinomial(
-                            probs_remask,
-                            num_samples=k,
-                            replacement=False
-                        )
+                        probs_remask = uncertainties / (uncertainties.sum() + 1e-8)
+                        remask_indices = torch.multinomial(probs_remask, num_samples=k, replacement=False)
                     else:
                         uncertainties = 1.0 - scores
-                        _, remask_indices = torch.topk(
-                            uncertainties,
-                            k=k
-                        )
-                    next_dream[b, remask_indices] = (
-                        self.mask_token_id
-                    )
-            cur_dream = next_dream
-            collected_boards.append(curr_dream.cpu().numpy()[n_of_samples_to_collect:])  # Collect the first sample for visualization
+                        _, remask_indices = torch.topk(uncertainties, k=k)
 
-        return collected_boards, cur_dream
+                    next_dream[b, remask_indices] = self.mask_token_id
+
+            cur_dream = next_dream
+
+        return intermediate_boards, cur_dream
 
     def load_parameters(self):
         path = self.model_id
@@ -409,7 +390,9 @@ class GoalPredictorPixelDiff:
         print(f"Model parameters loaded from {path}")
 
 
-    def fit_and_dump(self, training_data, validation_data, epochs, dump_folder, checkpoints=None):
+    def fit_and_dump(self, training_data, validation_data, epochs,
+                     dump_folder, checkpoints=None,
+                     n_samples_to_collect=5):
         # 1. Flatten the inputs to (N, 144) to avoid 3D broadcasting errors
         (t_inputs, t_targets) = training_data
         train_x = torch.tensor(t_inputs[0], dtype=torch.long).reshape(t_inputs[0].shape[0], -1)
@@ -530,17 +513,8 @@ class GoalPredictorPixelDiff:
             })
 
             if epoch % 5 == 0:
-                grid_img = self.predict_and_get_wandb_image(val_x[0:1], val_g[0:1],
-                                                            ground_truth_subgoal=val_y[0:1])
-                wandb.log({"media/diffusion_process_sample1": grid_img})
-
-                grid_img = self.predict_and_get_wandb_image(val_x[1:2], val_g[1:2],
-                                                            ground_truth_subgoal=val_y[1:2])
-                wandb.log({"media/diffusion_process_sample2": grid_img})
-
-                grid_img = self.predict_and_get_wandb_image(val_x[2:3], val_g[2:3],
-                                                            ground_truth_subgoal=val_y[2:3])
-                wandb.log({"media/diffusion_process_sample3": grid_img})
+                self.predict_and_get_wandb_image(val_x[n_samples_to_collect:], val_g[n_samples_to_collect:],
+                                                 ground_truth_subgoal=val_y[n_samples_to_collect:])
 
             print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Delta Acc: {avg_val_delta:.4f} | Wall Stability: {avg_val_wall:.4f} | Full Denoise Acc: {val_full_denoise_acc:.4f}")
             log_scalar('val_delta_accuracy', epoch, avg_val_delta)
@@ -597,32 +571,11 @@ class GoalPredictorPixelDiff:
 
         batch_size = input_tokens.shape[0]
 
-        # Data collection for 4x4 grid (16 slots):
-        # Slot 0: Input Board
-        # Slot 1: Ground Truth Subgoal (if available)
-        # Slots 2-13: 12 Intermediate Diffusion Steps
-        # Slot 14: Final Dream (Prediction)
-        # Slot 15: Final Board (Solved State)
-        collected_boards = []
-        collected_labels = []
-        # Slot 0: Input state
-        collected_boards.append(input_tokens[n_of_samples_to_collect:].copy())
-        collected_labels.append("Initial Input")
-
-        # Slot 1: Ground Truth Subgoal (or placeholder)
-        if gt_subgoal_tokens is not None:
-            collected_boards.append(gt_subgoal_tokens[n_of_samples_to_collect:].copy())
-            collected_labels.append("GT Subgoal")
-        else:
-            collected_boards.append(input_tokens[n_of_samples_to_collect:].copy())  # duplicate input as placeholder
-            collected_labels.append("(No GT)")
-
-
-        # 2. Setup Tensors
+        # 2. Setup Tensors and Run Denoising Pipeline
         inp = torch.tensor(input_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
         cond = torch.tensor(cond_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
 
-        collected_boards, cur_dream = self._denoise(
+        intermediate_history, cur_dream = self._denoise(
             inp,
             cond,
             inf_steps=steps,
@@ -631,33 +584,85 @@ class GoalPredictorPixelDiff:
             n_of_samples_to_collect=n_of_samples_to_collect
         )
 
-        # Add final state
         dream_tokens_flat = cur_dream.cpu().numpy().reshape(batch_size, 144)
-        collected_boards.append(dream_tokens_flat[n_of_samples_to_collect:])
-        collected_labels.append("Final Dream")
-
-        # Slot 15: Final Board (solved state)
-        collected_boards.append(cond_tokens[n_of_samples_to_collect:])
-        collected_labels.append("Final Board")
-
-        # 4. Visualization
-        save_path = save_diffusion_grid(
-            collected_boards, collected_labels, self.dump_folder, self._predictions_counter
-        )
-
-        # 5. Legacy Adapter Logic (Returning PDF to Solver)
         input_tokens_flat = input_tokens.reshape(batch_size, 144)
+        cond_tokens_flat = cond_tokens.reshape(batch_size, 144)
+
+        # 3. Generate separate diagnostic grids for the first N samples
+        num_visualize = min(batch_size, n_of_samples_to_collect)
+        save_paths = []
+        collect_steps = torch.linspace(0, steps - 1, steps=12, dtype=torch.long).tolist()
+
+        for b in range(num_visualize):
+            sample_boards = []
+            sample_labels = []
+
+            # Slot 0: Input state
+            sample_boards.append(input_tokens_flat[b])
+            sample_labels.append("Initial Input")
+
+            # Slot 1: Ground Truth Subgoal (or fallback placeholder)
+            if gt_subgoal_tokens is not None:
+                gt_flat = gt_subgoal_tokens.reshape(batch_size, 144)
+                sample_boards.append(gt_flat[b])
+                sample_labels.append("GT Subgoal")
+            else:
+                sample_boards.append(input_tokens_flat[b])
+                sample_labels.append("(No GT)")
+
+            # Slots 2-13: The 12 Intermediate Diffusion Steps
+            for idx, step_idx in enumerate(collect_steps):
+                sample_boards.append(intermediate_history[idx][b])
+                sample_labels.append(f"Step {step_idx}")
+
+            # Slot 14: Final Dream (Prediction)
+            sample_boards.append(dream_tokens_flat[b])
+            sample_labels.append("Final Dream")
+
+            # Slot 15: Final Board (Solved State Goal)
+            sample_boards.append(cond_tokens_flat[b])
+            sample_labels.append("Final Board")
+
+            # Save the plot grid specifically for this sample item
+            unique_batch_idx = f"{self._predictions_counter}_sample_{b}"
+            path = save_diffusion_grid(
+                boards=sample_boards,
+                steps=sample_labels,
+                dump_folder=self.dump_folder,
+                batch_idx=unique_batch_idx
+            )
+            save_paths.append(path)
+
+        # 4. Corrected Adaptive Translation Logic
         pdf_1009 = np.zeros((batch_size, 1009))
+
         for b in range(batch_size):
-            diffs = np.where(input_tokens_flat[b] != dream_tokens_flat[b])[0]
-            if len(diffs) == 0:
+            # Find all tiles where the current node board differs from our diffusion dream
+            diff_indices = np.where(input_tokens_flat[b] != dream_tokens_flat[b])[0]
+            num_diffs = len(diff_indices)
+
+            if num_diffs == 0:
+                # The GoalBuilder successfully finished building our dream! Trigger STOP.
                 pdf_1009[b, 1008] = 1.0
             else:
-                idx = diffs[0]
-                target_tile = dream_tokens_flat[b, idx]
-                pdf_1009[b, (idx * 7) + target_tile] = 1.0
+                # Provide an "Exit Strategy": give the stop bit a baseline probability (e.g., 20%)
+                # This allows smart_sample to gracefully consider a node finished even if
+                # minor non-essential tiles haven't perfectly shifted yet.
+                stop_prob = 0.20
+                pdf_1009[b, 1008] = stop_prob
 
-        return pdf_1009, save_path
+                # Distribute the remaining 80% probability evenly across ALL missing edits.
+                # This restores the tree's ability to branch out and try different path variants.
+                remaining_prob = 1.0 - stop_prob
+                prob_per_edit = remaining_prob / num_diffs
+
+                for idx in diff_indices:
+                    target_tile = dream_tokens_flat[b, idx]
+                    flat_action_index = (idx * 7) + target_tile
+                    pdf_1009[b, flat_action_index] = prob_per_edit
+
+        return pdf_1009, save_paths
+
 
     def save_model(self, path):
         torch.save({

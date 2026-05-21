@@ -187,8 +187,6 @@ class BFSGoalBuilderSokobanPixelDiff(GoalBuilder):
             conditions = np.array([node.condition for node in nodes_to_expand])
             pdfs, save_path = self.goal_generating_network.predict_pdf_batch(input_boards, conditions)
 
-
-
             tree_levels.setdefault(current_level_to_expand + 1, [])
 
             for node, pdf in zip(nodes_to_expand, pdfs):
