@@ -1,8 +1,10 @@
 import gc
 import os
+from collections import defaultdict
 
 import wandb
-wandb.login("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")
+wandb.login()
+# wandb.login("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")
 
 from datetime import datetime
 import numpy as np
@@ -35,6 +37,7 @@ import numpy as np
 from metric_logging import log_scalar
 from envs import Sokoban
 from supervised import DataCreatorSokobanPixelDiff
+from goal_generating_networks.sokoban_metrics import compute_sokoban_metrics
 
 import matplotlib.pyplot as plt
 import os
@@ -92,76 +95,6 @@ def save_diffusion_grid(boards, steps, dump_folder, batch_idx=0):
     return save_path
 
 
-# --- PyTorch Transformer Module ---
-# class SokobanTransformer(nn.Module):
-#     architecture_name = "architecture1"
-#     def __init__(self, vocab_size=8, seq_len=144, d_model=128, nhead=8, num_layers=4):
-#         super().__init__()
-#         # 1. Create separate embedding dictionaries for Time/Context separation
-#         self.emb_curr = nn.Embedding(vocab_size, d_model)
-#         self.emb_goal = nn.Embedding(vocab_size, d_model)
-#         self.emb_mask = nn.Embedding(vocab_size, d_model)
-#         self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, d_model))
-#         self.input_projection = nn.Linear(d_model * 3, d_model)
-#         self.output_layer = nn.Linear(d_model, 7)  # Output 7 classes (IDs 0-6)
-#         self.mask_token_id = 7
-#
-#         encoder_layer = nn.TransformerEncoderLayer(
-#             d_model=d_model,
-#             nhead=nhead,
-#             dim_feedforward=d_model * 4,
-#             batch_first=True,
-#             activation='gelu'
-#         )
-#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-#         print("Model MDLM initiated with Separated Condition Embeddings!")
-#
-#     def apply_stochastic_mask(self, target_board):
-#         """
-#         Refined Forward Process:
-#         1. Samples a random mask ratio 't'.
-#         2. Protects walls (Token 0) from being masked.
-#         3. Replaces eligible tokens with MASK_ID.
-#         """
-#         device = target_board.device
-#         # 1. Sample ratio t ~ U(0, 1)
-#         mask_ratio = torch.rand(target_board.size(0), 1, device=device)
-#
-#         # 2. Identify eligible non-wall tokens
-#         mask_eligible = (target_board != 0)
-#
-#         # 3. Generate mask indices based on ratio[cite: 1]
-#         mask_indices = (torch.rand(target_board.shape, device=device) < mask_ratio) & mask_eligible
-#
-#         masked_inputs = target_board.clone()
-#         masked_inputs[mask_indices] = self.mask_token_id
-#
-#         return masked_inputs, mask_indices, mask_ratio
-#
-#     def forward(self, current_state, final_goal, masked_subgoal):
-#         curr = current_state.view(current_state.size(0), -1).long()
-#         goal = final_goal.view(final_goal.size(0), -1).long()
-#         mask = masked_subgoal.view(masked_subgoal.size(0), -1).long()
-#
-#         # 3. Embed each state using its specific dictionary
-#         e_curr = self.emb_curr(curr)
-#         e_goal = self.emb_goal(goal)
-#         e_mask = self.emb_mask(mask)
-#
-#         # 4. Concatenate along the feature dimension (dim=-1)
-#         # Shape goes from (Batch, 144, 128) -> (Batch, 144, 384)
-#         x_concat = torch.cat([e_curr, e_goal, e_mask], dim=-1)
-#
-#         # 5. Project back to d_model -> (Batch, 144, 128)
-#         x = self.input_projection(x_concat)
-#
-#         # Add positional encoding
-#         x = x + self.pos_embedding
-#
-#         feat = self.transformer(x)
-#         return self.output_layer(feat)
-
-
 class DiTBlock(nn.Module):
     """
     A Transformer block that uses Adaptive Layer Norm (adaLN)
@@ -190,6 +123,17 @@ class DiTBlock(nn.Module):
         )
 
     def forward(self, x, context, t_emb):
+        """
+        Block structure:
+        1. Self-Attention with adaLN modulation
+        2. Cross-Attention (conditioning on context) with adaLN modulation
+        3. Feed-Forward with adaLN modulation.
+        Why need cross attention for initial and goal state board?
+        Because the model needs to learn how to use the conditioning information (initial and goal states)
+        to guide the denoising process. The cross-attention allows the model to attend to relevant parts of
+        the initial and goal state representations when processing the latent board, enabling it to make informed
+        updates that move towards the goal configuration.
+        """
         # Generate modulation parameters from the time embedding
         # We split the output into 6 vectors: (shift1, scale1, shift2, scale2, shift3, scale3)
         mods = self.adaLN_modulation(t_emb).chunk(6, dim=-1)
@@ -211,7 +155,7 @@ class DiTBlock(nn.Module):
 
 
 class SokobanTransformer(nn.Module):
-    architecture_name = "architecture2"
+    architecture_name = "architecture4"
 
     def __init__(self, vocab_size=8, d_model=256, nhead=8, num_layers=6):
         super().__init__()
@@ -251,20 +195,44 @@ class SokobanTransformer(nn.Module):
 
     def apply_stochastic_mask(self, target_board):
         """
-        Refined Forward Process:
-        1. Samples a random mask ratio 't'.
-        2. Protects walls (Token 0) from being masked.
-        3. Replaces eligible tokens with MASK_ID.
+        Vectorized forward process that masks exactly t% of eligible tokens.
+
+        Steps:
+        1. Sample a random mask ratio t ~ U(0, 1) for each sample in the batch.
+        2. Create a boolean mask of eligible positions (non-wall tokens).
+        3. For each eligible position, assign a random priority score.
+        4. Compute the threshold priority that corresponds to the t-th quantile among eligible tokens.
         """
         device = target_board.device
-        # 1. Sample ratio t ~ U(0, 1)
-        mask_ratio = torch.rand(target_board.size(0), 1, device=device)
+        batch_size, seq_len = target_board.shape
 
-        # 2. Identify eligible non-wall tokens
-        mask_eligible = (target_board != 0)
+        # 1. Sample t ~ U(0, 1)
+        mask_ratio = torch.rand(batch_size, 1, device=device)
 
-        # 3. Generate mask indices based on ratio[cite: 1]
-        mask_indices = (torch.rand(target_board.shape, device=device) < mask_ratio) & mask_eligible
+        # 2. Eligible mask (non-wall)
+        mask_eligible = (target_board != 0)  # (B, 144)
+
+        # 3. For each eligible position, assign a random priority
+        #    Non-eligible positions get priority > 1 (will never be selected)
+        rand_priorities = torch.rand(batch_size, seq_len, device=device)
+        rand_priorities[~mask_eligible] = 2.0  # Push walls to the end
+
+        # 4. Compute the threshold: the t-th quantile among eligible tokens
+        #    Sort priorities, find the cutoff index
+        num_eligible = mask_eligible.float().sum(dim=1, keepdim=True)  # (B, 1)
+        num_to_mask = torch.clamp((mask_ratio * num_eligible).floor(), min=1)  # (B, 1) at least 1
+
+        # 5. Use topk to find the positions to mask
+        #    We want the num_to_mask smallest priorities (among eligible)
+        #    Equivalent: threshold = sorted_priorities[num_to_mask]
+        sorted_priorities, _ = rand_priorities.sort(dim=1)  # (B, 144)
+        
+        # Gather the threshold value for each sample
+        threshold_idx = (num_to_mask - 1).long().clamp(0, seq_len - 1)  # (B, 1)
+        thresholds = sorted_priorities.gather(1, threshold_idx)  # (B, 1)
+
+        # 6. Mask positions with priority <= threshold AND eligible
+        mask_indices = (rand_priorities <= thresholds) & mask_eligible
 
         masked_inputs = target_board.clone()
         masked_inputs[mask_indices] = self.mask_token_id
@@ -273,13 +241,13 @@ class SokobanTransformer(nn.Module):
 
     def forward(self, current_state, final_goal, masked_subgoal, t):
         # 1. Embeddings + 2D Positional Bias
-        e_curr = self.token_emb(current_state.view(-1, 144)) + self.pos_emb
-        e_goal = self.token_emb(final_goal.view(-1, 144)) + self.pos_emb
-        e_mask = self.token_emb(masked_subgoal.view(-1, 144)) + self.pos_emb
+        e_curr = self.token_emb(current_state.view(-1, 144)) + self.get_2d_pos()
+        e_goal = self.token_emb(final_goal.view(-1, 144)) + self.get_2d_pos()
+        e_mask = self.token_emb(masked_subgoal.view(-1, 144)) + self.get_2d_pos()
 
         # 2. Prepare Context and Time info
-        context = torch.cat([e_curr, e_goal], dim=1) # (Batch, 288, d_model)
-        t_emb = self.time_mlp(t) # (Batch, d_model)
+        context = torch.cat([e_curr, e_goal], dim=1)  # (Batch, 288, d_model)
+        t_emb = self.time_mlp(t)  # (Batch, d_model)
 
         # 3. Process Latent Board
         x = e_mask
@@ -291,7 +259,7 @@ class SokobanTransformer(nn.Module):
 
 # --- Modified Class ---
 class GoalPredictorPixelDiff:
-    def __init__(self, num_layers=4, model_id=None, learning_rate=0.001, batch_size=32):
+    def __init__(self, num_layers=4, model_id=None, learning_rate=0.001, temperature=.8, batch_size=32):
         self.core_env = Sokoban()
         self.dim_room = self.core_env.get_dim_room()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -306,8 +274,10 @@ class GoalPredictorPixelDiff:
         self._predictions_counter = 0
         self.mask_token_id = 7
         self.data_creator = DataCreatorSokobanPixelDiff()
+        self._temperature = temperature
 
         self.date_now = datetime.now().strftime('%H-%M-%d-%m-%Y')
+        self.predictor_name = "v3_full_remask"
 
 
     def construct_networks(self):
@@ -328,7 +298,7 @@ class GoalPredictorPixelDiff:
             self.load_parameters()
 
         # init wandb
-        run_name = f"{self._model.architecture_name}_{self.date_now}"
+        run_name = f"{self.predictor_name}_{self._model.architecture_name}_{self.date_now}"
         wandb.init(
             project="sokoban-diffusion-llm",
             entity="bedkowski-patrick",
@@ -342,6 +312,94 @@ class GoalPredictorPixelDiff:
             }
         )
 
+    def _denoise(
+            self,
+            inp,
+            cond,
+            inf_steps=256,
+            stochastic=True,
+            temperature=1.0,
+            n_of_samples_to_collect=5):
+        """
+        Performs the iterative denoising process.
+        Returning the final "dream" board and a list of intermediate boards for visualization.
+        """
+
+        collected_boards = []
+        batch_size, seq_len = inp.shape
+        device = inp.device
+
+        wall_mask = (inp == 0)
+        eligible_mask = ~wall_mask
+        num_eligible = eligible_mask.sum(dim=1)
+
+        cur_dream = torch.full_like(inp, self.mask_token_id)
+        cur_dream[wall_mask] = 0
+
+        timesteps = torch.linspace(
+            1.0,
+            0.0,
+            inf_steps + 1,
+            device=device
+        )
+
+        for step in range(inf_steps):
+            t_current = timesteps[step]
+            t_next = timesteps[step + 1]
+            t_input = t_current.view(1, 1).expand(batch_size, 1)
+            logits = self._model(
+                inp,
+                cond,
+                cur_dream,
+                t_input
+            )
+
+            scaled_logits = logits / temperature
+            probs = torch.softmax(scaled_logits, dim=-1)
+            confidences, predictions = probs.max(dim=-1)
+
+            num_to_mask = (
+                    t_next * num_eligible
+            ).long()
+            next_dream = predictions.clone()
+            next_dream[wall_mask] = 0
+            if step != inf_steps - 1:
+                for b in range(batch_size):
+                    k = min(
+                        num_to_mask[b].item(),
+                        eligible_mask[b].sum().item()
+                    )
+
+                    if k == 0:
+                        continue
+                    scores = confidences[b].clone()
+                    scores[wall_mask[b]] = 1.0
+                    if stochastic:
+                        uncertainties = 1.0 - scores
+                        uncertainties[wall_mask[b]] = 0
+                        probs_remask = (
+                                uncertainties /
+                                (uncertainties.sum() + 1e-8)
+                        )
+                        remask_indices = torch.multinomial(
+                            probs_remask,
+                            num_samples=k,
+                            replacement=False
+                        )
+                    else:
+                        uncertainties = 1.0 - scores
+                        _, remask_indices = torch.topk(
+                            uncertainties,
+                            k=k
+                        )
+                    next_dream[b, remask_indices] = (
+                        self.mask_token_id
+                    )
+            cur_dream = next_dream
+            collected_boards.append(curr_dream.cpu().numpy()[n_of_samples_to_collect:])  # Collect the first sample for visualization
+
+        return collected_boards, cur_dream
+
     def load_parameters(self):
         path = self.model_id
         print("loading model parameters from {}".format(path))
@@ -350,9 +408,9 @@ class GoalPredictorPixelDiff:
         # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print(f"Model parameters loaded from {path}")
 
+
     def fit_and_dump(self, training_data, validation_data, epochs, dump_folder, checkpoints=None):
         # 1. Flatten the inputs to (N, 144) to avoid 3D broadcasting errors
-        # x[0] is current, x[1] is final goal
         (t_inputs, t_targets) = training_data
         train_x = torch.tensor(t_inputs[0], dtype=torch.long).reshape(t_inputs[0].shape[0], -1)
         train_cond = torch.tensor(t_inputs[1], dtype=torch.long).reshape(t_inputs[1].shape[0], -1)
@@ -367,42 +425,30 @@ class GoalPredictorPixelDiff:
             train_x.shape, train_y.shape, train_cond.shape))
         print(f"DEBUG: Validation X shape: {val_x.shape} | Validation Y shape: {val_y.shape} | Validation G shape: {val_g.shape}")
 
-        # print('DATA SAVED')
-        # # save example inputs to the txt file
-        # with open(os.path.join(dump_folder, 'example_inputs.txt'), 'w') as f:
-        #     f.write(f"Example Training Input (current state):\n{train_x[0].view(12, 12)}\n")
-        #     f.write(f"Example Training Condition (final goal):\n{train_cond[0].view(12, 12)}\n")
-        #     f.write(f"Example Training Target (midpoint):\n{train_y[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Input (current state):\n{val_x[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Condition (final goal):\n{val_g[0].view(12, 12)}\n")
-        #     f.write(f"Example Validation Target (midpoint):\n{val_y[0].view(12, 12)}\n")
-
         num_samples = train_x.shape[0]
 
         for epoch in range(epochs):
             # --- TRAINING PHASE ---
             self._model.train()
             epoch_train_loss = 0
-            indices = torch.randperm(num_samples)  # used for randomly shuffling the data at each epoch
+            indices = torch.randperm(num_samples)
 
-            for i in range(0, num_samples, self.batch_size):  # process all the batches
+            # forward
+            for i in range(0, num_samples, self.batch_size):  # calculate the batches
                 batch_idx = indices[i:i + self.batch_size]
                 b_x = train_x[batch_idx].to(self.device)
                 b_cond = train_cond[batch_idx].to(self.device)
                 b_y = train_y[batch_idx].to(self.device)
 
-                # 1. MASKING LOGIC: Only mask non-wall tokens
+                # 1. MASKING LOGIC
                 masked_inputs, mask_indices, mask_ratio = self._model.apply_stochastic_mask(b_y)
                 logits = self._model(b_x, b_cond, masked_inputs, mask_ratio)
 
-                # 2. WEIGHTED LOSS: Apply token weights and LLaDA 1/t weighting
-                # CrossEntropy expects (B, C, L)
+                # 2. LOSS: only on masked positions, normalized by count
                 loss_raw = self.criterion(logits.transpose(1, 2), b_y)
-
-                # LLaDA Objective: Weight the loss on masked tokens by 1/t
-                # This prevents the model from ignoring samples with high masking ratios.
-                t_weighted_loss = (loss_raw * mask_indices).sum(dim=1) / (mask_ratio.squeeze() * b_y.size(1) + 1e-6)
-                final_loss = t_weighted_loss.mean()
+                masked_loss = (loss_raw * mask_indices.float()).sum(dim=1)
+                num_masked = mask_indices.float().sum(dim=1)
+                final_loss = (masked_loss / (num_masked + 1e-6)).mean()
 
                 self.optimizer.zero_grad()
                 final_loss.backward()
@@ -417,60 +463,60 @@ class GoalPredictorPixelDiff:
             val_full_denoise_acc = 0
 
             with torch.no_grad():
+                all_metrics = defaultdict(list)
                 for i in range(0, val_x.size(0), self.batch_size):
                     bv_x = val_x[i:i + self.batch_size].to(self.device)
                     bv_cond = val_g[i:i + self.batch_size].to(self.device)
                     bv_y = val_y[i:i + self.batch_size].to(self.device)
 
                     # Standard Masking for Delta Check
-                    # If you are calculating validation loss or accuracy
                     v_masked_inputs, v_mask_indices, v_mask_ratio = self._model.apply_stochastic_mask(bv_y)
                     v_logits = self._model(bv_x, bv_cond, v_masked_inputs, v_mask_ratio)
-                    v_preds = torch.argmax(v_logits, dim=-1)
 
-                    # 3. WALL STABILITY ACCURACY
-                    # Check accuracy only on tokens that are walls in the ground truth
+                    scaled_logits = v_logits / self._temperature
+                    probs = torch.softmax(scaled_logits, -1)
+                    v_preds = torch.distributions.Categorical(
+                        probs
+                    ).sample()
+
+                    # WALL STABILITY ACCURACY
                     wall_mask = (bv_y == 0)
                     if wall_mask.sum() > 0:
                         wall_correct = (v_preds == bv_y) & wall_mask
                         val_wall_acc += wall_correct.sum().item() / (wall_mask.sum().item() + 1e-6)
 
-                    # DELTA ACCURACY: Only check accuracy on tiles that changed (Agent/Boxes)
+                    # DELTA ACCURACY
                     change_mask = (bv_x != bv_y)
                     critical_mask = v_mask_indices & change_mask
                     if critical_mask.sum() > 0:
                         correct = (v_preds == bv_y) & critical_mask
                         val_delta_acc += correct.sum().item() / (critical_mask.sum().item() + 1e-6)
 
-                    # FULL DENOISING CHECK (LLaDA Low-Confidence Remasking)
+                    # ============================================================
+                    # FULL DENOISING: Approach 1 — Full Re-evaluation at Each Step
+                    # ============================================================
                     if i == 0:
-                        inf_steps = 256
-                        cur_dream = torch.full_like(bv_y, self.mask_token_id)
-                        # PROTECT WALLS in starting dream: Start with walls already visible
-                        cur_dream = torch.where(bv_x == 0, 0, cur_dream)
-
-                        timesteps = torch.linspace(1, 0, inf_steps + 1)
-                        for step in range(inf_steps):
-                            t_next = timesteps[step + 1]
-                            i_logits = self._model(bv_x, bv_cond, cur_dream, t_next.unsqueeze(0).to(self.device))
-                            i_probs = torch.softmax(i_logits, dim=-1)
-                            confidences, predictions = torch.max(i_probs, dim=-1)
-
-                            is_masked = (cur_dream == self.mask_token_id)
-                            num_to_keep = int((1 - t_next) * bv_y.size(1))
-
-                            for b in range(bv_x.size(0)):
-                                score = confidences[b].clone()
-                                score[~is_masked[b]] = 1.1
-                                _, top_indices = torch.topk(score, k=num_to_keep)
-
-                                new_state = torch.full_like(cur_dream[b], self.mask_token_id)
-                                # Keep walls visible even if they weren't in top-k
-                                new_state[bv_x[b] == 0] = 0
-                                new_state[top_indices] = predictions[b][top_indices]
-                                cur_dream[b] = new_state
-
+                        cur_dream = self._denoise(
+                            bv_x,
+                            bv_cond,
+                            inf_steps=256,
+                            stochastic=True,
+                            temperature=self._temperature
+                        )
                         val_full_denoise_acc = (cur_dream == bv_y).float().mean().item()
+
+                        # Compute all metrics
+                        batch_metrics = compute_sokoban_metrics(
+                            pred_board=cur_dream,
+                            input_board=bv_x,
+                            target_board=bv_y,
+                            goal_board=bv_cond
+                        )
+                        for k, v in batch_metrics.items(): all_metrics[k].append(v)
+
+            # Average across all batches
+            avg_metrics = {k: np.mean(v) for k, v in all_metrics.items()}
+            wandb.log({f"val_rules/{k}": v for k, v in avg_metrics.items()})
 
             avg_val_delta = val_delta_acc / (val_x.size(0) / self.batch_size)
             avg_val_wall = val_wall_acc / (val_x.size(0) / self.batch_size)
@@ -484,29 +530,35 @@ class GoalPredictorPixelDiff:
             })
 
             if epoch % 5 == 0:
-                grid_img = self.predict_and_get_wandb_image(val_x[0:1], val_g[0:1])
-                wandb.log({"media/diffusion_process": grid_img})
+                grid_img = self.predict_and_get_wandb_image(val_x[0:1], val_g[0:1],
+                                                            ground_truth_subgoal=val_y[0:1])
+                wandb.log({"media/diffusion_process_sample1": grid_img})
 
-            print(f"Epoch {epoch} | Delta Acc: {avg_val_delta:.4f} | Wall Stability: {avg_val_wall:.4f} | Full Denoise Acc: {val_full_denoise_acc:.4f}")
+                grid_img = self.predict_and_get_wandb_image(val_x[1:2], val_g[1:2],
+                                                            ground_truth_subgoal=val_y[1:2])
+                wandb.log({"media/diffusion_process_sample2": grid_img})
+
+                grid_img = self.predict_and_get_wandb_image(val_x[2:3], val_g[2:3],
+                                                            ground_truth_subgoal=val_y[2:3])
+                wandb.log({"media/diffusion_process_sample3": grid_img})
+
+            print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Delta Acc: {avg_val_delta:.4f} | Wall Stability: {avg_val_wall:.4f} | Full Denoise Acc: {val_full_denoise_acc:.4f}")
             log_scalar('val_delta_accuracy', epoch, avg_val_delta)
             log_scalar('val_full_denoise_acc', epoch, val_full_denoise_acc)
-
-            # Logging
-            print(
-                f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f}")
             log_scalar('train_loss', epoch, avg_train_loss)
 
             if checkpoints is not None and epoch in checkpoints:
                 self.save_model(os.path.join(dump_folder, f'epoch_{epoch}.pt'))
 
-    def predict_and_get_wandb_image(self, input_boards, conditions):
+    def predict_and_get_wandb_image(self, input_boards, conditions, ground_truth_subgoal=None):
         """Helper to run prediction and return a wandb Image object."""
-        # This calls your predict_pdf_batch logic but returns the plot
-        _, plot_path = self.predict_pdf_batch(input_boards.cpu().numpy(), conditions.cpu().numpy(), steps=256)
-        # save_diffusion_grid(..., dump_folder=self.dump_folder)
+        _, plot_path = self.predict_pdf_batch(
+            input_boards.cpu().numpy(), conditions.cpu().numpy(), ground_truth_subgoal=ground_truth_subgoal.cpu().numpy() if ground_truth_subgoal is not None else None, steps=256
+        )
         return wandb.Image(plot_path, caption="Diffusion Steps")
 
-    def predict_pdf_batch(self, input_boards, conditions, steps=256):
+    def predict_pdf_batch(self, input_boards, conditions, ground_truth_subgoal=None,
+                          steps=256, n_of_samples_to_collect=5):
         self._predictions_counter += 1
         self._model.eval()
 
@@ -516,70 +568,82 @@ class GoalPredictorPixelDiff:
 
         # Handle Input Boards (144 vs 1008)
         if input_boards.shape[-1] == 1008:
-            # Reshape (B, 1008) -> (B, 144, 7) then argmax to (B, 144)
             input_tokens = np.argmax(input_boards.reshape(-1, 144, 7), axis=-1)
         elif input_boards.shape[-1] == 7:
             input_tokens = np.argmax(input_boards, axis=-1)
         else:
             input_tokens = input_boards
 
-        # Handle Conditions / Final Goal (The likely source of the 1008)
+        # Handle Conditions / Final Goal
         if conditions.shape[-1] == 1008:
-            # Reshape (B, 1008) -> (B, 144, 7) then argmax to (B, 144)
             cond_tokens = np.argmax(conditions.reshape(-1, 144, 7), axis=-1)
         elif conditions.shape[-1] == 7:
-            conditions = np.argmax(conditions, axis=-1)
+            cond_tokens = np.argmax(conditions, axis=-1)
+        else:
+            cond_tokens = conditions
+
+        # Handle Ground Truth Subgoal (if provided)
+        if ground_truth_subgoal is not None:
+            if ground_truth_subgoal.ndim == 3:
+                ground_truth_subgoal = np.expand_dims(ground_truth_subgoal, axis=0)
+            if ground_truth_subgoal.shape[-1] == 1008:
+                gt_subgoal_tokens = np.argmax(ground_truth_subgoal.reshape(-1, 144, 7), axis=-1)
+            elif ground_truth_subgoal.shape[-1] == 7:
+                gt_subgoal_tokens = np.argmax(ground_truth_subgoal, axis=-1)
+            else:
+                gt_subgoal_tokens = ground_truth_subgoal
+        else:
+            gt_subgoal_tokens = None
 
         batch_size = input_tokens.shape[0]
 
-        # Data collection for 4x4 grid (16 slots)
-        # Slot 0: Input, Slot 15: Final, Slots 1-14: Intermediate
+        # Data collection for 4x4 grid (16 slots):
+        # Slot 0: Input Board
+        # Slot 1: Ground Truth Subgoal (if available)
+        # Slots 2-13: 12 Intermediate Diffusion Steps
+        # Slot 14: Final Dream (Prediction)
+        # Slot 15: Final Board (Solved State)
         collected_boards = []
         collected_labels = []
-
-        # Save the absolute input state as the first slot
-        collected_boards.append(input_tokens[0].copy())
+        # Slot 0: Input state
+        collected_boards.append(input_tokens[n_of_samples_to_collect:].copy())
         collected_labels.append("Initial Input")
+
+        # Slot 1: Ground Truth Subgoal (or placeholder)
+        if gt_subgoal_tokens is not None:
+            collected_boards.append(gt_subgoal_tokens[n_of_samples_to_collect:].copy())
+            collected_labels.append("GT Subgoal")
+        else:
+            collected_boards.append(input_tokens[n_of_samples_to_collect:].copy())  # duplicate input as placeholder
+            collected_labels.append("(No GT)")
+
 
         # 2. Setup Tensors
         inp = torch.tensor(input_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
-        cond = torch.tensor(conditions.reshape(batch_size, -1), dtype=torch.long).to(self.device)
-        cur_subgoals = torch.full((batch_size, 144), self.mask_token_id, dtype=torch.long).to(self.device)
+        cond = torch.tensor(cond_tokens.reshape(batch_size, -1), dtype=torch.long).to(self.device)
 
-        # 3. Diffusion Loop
-        # Calculate which indices to save to fill the 14 intermediate slots
-        # 256 / 14 ~ every 18 steps
-        save_indices = np.linspace(0, steps - 1, 14, dtype=int)
+        collected_boards, cur_dream = self._denoise(
+            inp,
+            cond,
+            inf_steps=steps,
+            stochastic=True,
+            temperature=self._temperature,
+            n_of_samples_to_collect=n_of_samples_to_collect
+        )
 
-        for i in range(steps):
-            with torch.no_grad():
-                logits = self._model(inp, cond, cur_subgoals)
-                probs = torch.softmax(logits, dim=-1)
-                max_probs, pred_ids = torch.max(probs, dim=-1)
-
-                is_masked = (cur_subgoals == self.mask_token_id)
-                num_masked = is_masked[0].sum().item()
-                num_to_reveal = int(np.ceil(num_masked / (steps - i)))
-
-                for b in range(batch_size):
-                    if num_to_reveal > 0:
-                        conf = max_probs[b].clone()
-                        conf[~is_masked[b]] = -1.0
-                        _, top_idx = torch.topk(conf, k=min(num_to_reveal, num_masked))
-                        cur_subgoals[b, top_idx] = pred_ids[b, top_idx]
-
-            # Log to list if it's one of our 14 capture points
-            if i in save_indices:
-                collected_boards.append(cur_subgoals[0].cpu().numpy().copy())
-                collected_labels.append(f"Diff Step {i}")
-
-        # Add the Final Dream state as the 16th slot
-        dream_tokens_flat = cur_subgoals.cpu().numpy().reshape(batch_size, 144)
-        collected_boards.append(dream_tokens_flat[0])
+        # Add final state
+        dream_tokens_flat = cur_dream.cpu().numpy().reshape(batch_size, 144)
+        collected_boards.append(dream_tokens_flat[n_of_samples_to_collect:])
         collected_labels.append("Final Dream")
 
-        # 4. Trigger Visualization
-        save_path = save_diffusion_grid(collected_boards, collected_labels, self.dump_folder, self._predictions_counter)
+        # Slot 15: Final Board (solved state)
+        collected_boards.append(cond_tokens[n_of_samples_to_collect:])
+        collected_labels.append("Final Board")
+
+        # 4. Visualization
+        save_path = save_diffusion_grid(
+            collected_boards, collected_labels, self.dump_folder, self._predictions_counter
+        )
 
         # 5. Legacy Adapter Logic (Returning PDF to Solver)
         input_tokens_flat = input_tokens.reshape(batch_size, 144)
@@ -625,162 +689,16 @@ class GoalPredictorPixelDiff:
         return x, y, element
 
     def smart_sample(self, pdf, internal_confidence_level):
+        pdf = np.array(pdf).squeeze()  # ensure shape (1009,)
+        assert pdf.ndim == 1, f"Expected 1D pdf, got shape {pdf.shape}"
+        
         out, out_p = [], []
         for idx in reversed(np.argsort(pdf)):
-            out.append(self.flat_to_2d(idx))
-            out_p.append(pdf[idx])
-            if sum(out_p) > internal_confidence_level: break
+            out.append(self.flat_to_2d(int(idx)))  # explicit cast too
+            out_p.append(float(pdf[idx]))
+            if sum(out_p) > internal_confidence_level:
+                break
         return out, out_p
-#
-# class GoalPredictorPixelDiff:
-#     def __init__(
-#         self,
-#         num_layers=5,
-#         batch_norm=True,
-#         model_id=None,
-#         learning_rate=0.01,
-#         kernel_size=(5, 5),
-#         weight_decay=0.,
-#         batch_size=32
-#     ):
-#
-#         self.core_env = Sokoban()
-#         self.dim_room = self.core_env.get_dim_room()
-#
-#         self.num_layers = num_layers
-#         self.batch_norm = batch_norm
-#         self.model_id = model_id
-#
-#         self._model = None
-#         self._predictions_counter = 0
-#         self.learning_rate = learning_rate
-#         self.kernel_size = kernel_size
-#         self.weight_decay = weight_decay
-#         self.batch_size = batch_size
-#
-#     def construct_networks(self):
-#         if self._model is None:
-#             if self.model_id is None:
-#                 input_state = Input(batch_shape=(None, None, None, 7))
-#                 input_condition = Input(batch_shape=(None, None, None, 7))
-#
-#                 layer = Concatenate()([input_state, input_condition])
-#
-#                 for _ in range(self.num_layers):
-#                     layer = Conv2D(
-#                         filters=64,
-#                         kernel_size=self.kernel_size,
-#                         padding='same',
-#                         activation='relu',
-#                         kernel_regularizer=l2(self.weight_decay),
-#                     )(layer)
-#
-#                     if self.batch_norm:
-#                         layer = BatchNormalization()(layer)
-#
-#                 branch1 = Dense(7, activation='relu', kernel_regularizer=l2(self.weight_decay))(layer)
-#                 branch1 = Flatten()(branch1)
-#
-#                 branch2 = Dense(1, activation='relu', kernel_regularizer=l2(self.weight_decay))(layer)
-#                 # branch2 = Flatten()(branch2)
-#                 branch2 = GlobalAveragePooling2D()(branch2)
-#
-#                 output = Concatenate()([branch1, branch2])
-#                 output = Softmax()(output)
-#
-#                 self._model = Model(inputs=[input_state, input_condition], outputs=output)
-#                 self._model.compile(
-#                     loss='categorical_crossentropy',
-#                     metrics='accuracy',
-#                     optimizer=Adam(learning_rate=self.learning_rate)
-#                 )
-#
-#                 self.data_creator = DataCreatorSokobanPixelDiff()
-#             else:
-#                 self.load_model(self.model_id)
-#
-#     def reset_predictions_counter(self):
-#         self._predictions_counter = 0
-#
-#     def read_predictions(self):
-#         return self._predictions_counter
-#
-#     def load_data(self, dataset_file):
-#         self.data_creator.load(dataset_file)
-#
-#     def fit_and_dump(self, x, y, validation_data, epochs, dump_folder, checkpoints=None):
-#
-#         # --- ENHANCED DEBUG PRINTS ---
-#         import numpy as np
-#
-#         # --- UPDATED DEBUG FOR TOKENS ---
-#         print(f"DEBUG: Input X shape: {x.shape} | Target Y shape: {y.shape}")
-#         unique_tokens_x = np.unique(x)
-#         unique_tokens_y = np.unique(y)
-#         print(f"DEBUG: Unique tokens in X: {unique_tokens_x}")
-#         print(f"DEBUG: Unique tokens in Y: {unique_tokens_y}")
-#
-#         # Check if any tokens are outside the 0-6 range (ID 7 is reserved for MASK)
-#         if np.any(unique_tokens_y > 6):
-#             print("WARNING: Found tokens > 6 in target. Ensure ID 7 is reserved for MASK only.")
-#         # ---
-#
-#         for epoch in range(epochs):
-#             history = self._model.fit(x, y, batch_size=self.batch_size, epochs=1, validation_data=validation_data)
-#             train_history = history.history
-#             for metric, value in train_history.items():
-#                 log_scalar(metric, epoch, value[0])
-#             if checkpoints is not None and epoch in checkpoints:
-#                 print(f'saving model after {epoch} epochs.')
-#                 self.save_model(os.path.join(dump_folder, f'epoch_{epoch}'))
-#             gc.collect()
-#         self.save_model(os.path.join(dump_folder, f'epoch_{epoch}'))
-#
-#     def predict_pdf(self, input, condition):
-#         self._predictions_counter += 1
-#
-#         test_input = np.array([input])
-#         print(f"DEBUG: Inference Input Shape: {test_input.shape}")
-#
-#         raw =  self._model.predict([np.array([input]), np.array([condition])])[0]
-#         return raw
-#
-#     def predict_pdf_batch(self, input_boards, conditions):
-#         self._predictions_counter += 1
-#         raw =  self._model.predict([input_boards, conditions])
-#         return raw
-#
-#     def save_model(self, model_id):
-#         self._model.save(model_id)
-#
-#     def load_model(self, model_id):
-#         self._model = keras.models.load_model(model_id)
-#
-#     def flat_to_2d(self, n):
-#         element = n % 7
-#         base_n = n // 7
-#         x = base_n // self.dim_room[0]
-#         y = base_n % self.dim_room[1]
-#
-#         return x, y, element
-#
-#     def smart_sample(self, pdf, internal_confidence_level):
-#         assert internal_confidence_level > 0 and internal_confidence_level < 1, 'confidence_level must be between 0 and 1'
-#         out = []
-#         out_p = []
-#
-#         for idx in reversed(np.argsort(pdf)):
-#             out.append(self.flat_to_2d(idx))
-#             out_p.append(pdf[idx])
-#
-#             if sum(out_p) > internal_confidence_level:
-#                 break
-#
-#         return out, out_p
-
-
-import os
-import numpy as np
 
 
 def log_diffusion_details(file_path, step=None, board=None, input_board=None, diffs=None, mode="trace"):
